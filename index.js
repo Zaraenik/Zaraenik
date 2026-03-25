@@ -21,6 +21,10 @@ const app = express();
 app.get("/", (_, res) => res.send("Bot is running"));
 app.listen(PORT, () => console.log(`Server started on port ${PORT}`));
 
+/* =========================
+   UTILS
+========================= */
+
 function getDisplayName(user) {
   if (!user) return "Игрок";
   if (user.username) return `@${user.username}`;
@@ -76,6 +80,10 @@ function getRolesForCount(count) {
   return ["infected", "infected", "doctor", "scanner", "guard", "civilian", "civilian", "civilian"];
 }
 
+/* =========================
+   DB INIT
+========================= */
+
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS game_lobbies (
@@ -121,6 +129,10 @@ async function initDb() {
   `);
 }
 
+/* =========================
+   PROFILES
+========================= */
+
 async function ensureProfile(userId, name) {
   await pool.query(
     `
@@ -141,6 +153,10 @@ async function getProfile(userId, name = "Игрок") {
   );
   return res.rows[0];
 }
+
+/* =========================
+   LOBBY LOAD/SAVE
+========================= */
 
 async function getLobby(chatId) {
   const lobbyRes = await pool.query(
@@ -257,6 +273,10 @@ async function createLobby(chatId, creator) {
 async function deleteLobby(chatId) {
   await pool.query(`DELETE FROM game_lobbies WHERE chat_id = $1`, [String(chatId)]);
 }
+
+/* =========================
+   GAME HELPERS
+========================= */
 
 function getPlayer(lobby, userId) {
   return lobby.players.find((p) => String(p.id) === String(userId));
@@ -400,6 +420,10 @@ async function finishGame(lobby, winner) {
 
   await deleteLobby(lobby.chatId);
 }
+
+/* =========================
+   NIGHT
+========================= */
 
 function createNightKeyboard(lobby, actorId, action) {
   const alivePlayers = getAlivePlayers(lobby).filter((p) => String(p.id) !== String(actorId));
@@ -561,6 +585,10 @@ async function finishNight(lobby) {
   await startVoting(lobby);
 }
 
+/* =========================
+   VOTING IN GROUP
+========================= */
+
 function buildVotingKeyboard(lobby) {
   const alivePlayers = getAlivePlayers(lobby);
   return {
@@ -689,6 +717,10 @@ async function finishVoting(lobby) {
   await startNight(lobby);
 }
 
+/* =========================
+   JOIN
+========================= */
+
 async function addUserToLobby(user, chatId) {
   const lobby = await getLobby(chatId);
 
@@ -715,6 +747,10 @@ async function addUserToLobby(user, chatId) {
 
   return { ok: true, text: `✅ Ты добавлен в игру.\nТвой ник: ${name}` };
 }
+
+/* =========================
+   COMMANDS
+========================= */
 
 bot.onText(/^\/start(?:\s+(.+))?$/, async (msg, match) => {
   try {
@@ -926,6 +962,10 @@ bot.onText(/^\/top$/, async (msg) => {
   }
 });
 
+/* =========================
+   CALLBACKS
+========================= */
+
 bot.on("callback_query", async (query) => {
   try {
     const data = query.data || "";
@@ -1049,6 +1089,7 @@ bot.on("callback_query", async (query) => {
         lobby.votes[fromId] = "skip";
         await saveLobby(lobby);
         await bot.answerCallbackQuery(query.id, { text: "Ты выбрал пропуск." });
+
         await bot.sendMessage(
           lobby.chatId,
           `🗳 ${voter.name} проголосовал: *Пропуск*`,
@@ -1064,6 +1105,7 @@ bot.on("callback_query", async (query) => {
         lobby.votes[fromId] = String(targetId);
         await saveLobby(lobby);
         await bot.answerCallbackQuery(query.id, { text: `Ты голосуешь против ${target.name}` });
+
         await bot.sendMessage(
           lobby.chatId,
           `🗳 ${voter.name} проголосовал против ${target.name}`
