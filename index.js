@@ -1,53 +1,31 @@
 const express = require("express");
 const TelegramBot = require("node-telegram-bot-api");
+const { Pool } = require("pg");
 
 const token = process.env.BOT_TOKEN;
-if (!token) throw new Error("BOT_TOKEN не найден");
+const databaseUrl = process.env.DATABASE_URL;
+const BOT_USERNAME = process.env.BOT_USERNAME || "zaraenik_bot";
+const PORT = process.env.PORT || 3000;
 
-const BOT_USERNAME = "zaraenik_bot";
+if (!token) throw new Error("BOT_TOKEN не найден");
+if (!databaseUrl) throw new Error("DATABASE_URL не найден");
 
 const bot = new TelegramBot(token, { polling: true });
 
+const pool = new Pool({
+  connectionString: databaseUrl,
+  ssl: { rejectUnauthorized: false }
+});
+
 const app = express();
-const PORT = process.env.PORT || 3000;
-
-app.get("/", (_, res) => {
-  res.send("Bot is running");
-});
-
-app.listen(PORT, () => {
-  console.log(`Server started on port ${PORT}`);
-});
-
-const games = new Map();
-const profiles = new Map();
-
-function getProfile(userId, fallbackName = "Игрок") {
-  const key = String(userId);
-  if (!profiles.has(key)) {
-    profiles.set(key, {
-      userId: key,
-      name: fallbackName,
-      coins: 0,
-      games: 0,
-      wins: 0,
-      survived: 0
-    });
-  }
-  return profiles.get(key);
-}
-
-function updateProfileName(userId, name) {
-  const profile = getProfile(userId, name);
-  profile.name = name;
-  return profile;
-}
+app.get("/", (_, res) => res.send("Bot is running"));
+app.listen(PORT, () => console.log(`Server started on port ${PORT}`));
 
 function getDisplayName(user) {
   if (!user) return "Игрок";
   if (user.username) return `@${user.username}`;
-  const fullName = [user.first_name, user.last_name].filter(Boolean).join(" ").trim();
-  return fullName || `id${user.id}`;
+  const full = [user.first_name, user.last_name].filter(Boolean).join(" ").trim();
+  return full || `id${user.id}`;
 }
 
 function shuffle(array) {
@@ -89,42 +67,229 @@ function roleDescription(role) {
   }
 }
 
-function getGame(chatId) {
-  return games.get(String(chatId));
+function getRolesForCount(count) {
+  if (count < 4) return null;
+  if (count === 4) return ["infected", "doctor", "scanner", "civilian"];
+  if (count === 5) return ["infected", "doctor", "scanner", "civilian", "civilian"];
+  if (count === 6) return ["infected", "doctor", "scanner", "guard", "civilian", "civilian"];
+  if (count === 7) return ["infected", "infected", "doctor", "scanner", "guard", "civilian", "civilian"];
+  return ["infected", "infected", "doctor", "scanner", "guard", "civilian", "civilian", "civilian"];
 }
 
-function getPlayer(game, userId) {
-  return game.players.find((p) => String(p.id) === String(userId));
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS game_lobbies (
+      chat_id TEXT PRIMARY KEY,
+      creator_id TEXT NOT NULL,
+      creator_name TEXT NOT NULL,
+      started BOOLEAN NOT NULL DEFAULT FALSE,
+      phase TEXT NOT NULL DEFAULT 'lobby',
+      round_num INTEGER NOT NULL DEFAULT 1,
+      lobby_message_id BIGINT,
+      vote_message_id BIGINT,
+      vote_counts_message_id BIGINT,
+      night_actions JSONB NOT NULL DEFAULT '{}'::jsonb,
+      votes JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS game_players (
+      chat_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      alive BOOLEAN NOT NULL DEFAULT TRUE,
+      role TEXT,
+      joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (chat_id, user_id),
+      FOREIGN KEY (chat_id) REFERENCES game_lobbies(chat_id) ON DELETE CASCADE
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_profiles (
+      user_id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      coins INTEGER NOT NULL DEFAULT 0,
+      games INTEGER NOT NULL DEFAULT 0,
+      wins INTEGER NOT NULL DEFAULT 0,
+      survived INTEGER NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
 }
 
-function getAlivePlayers(game) {
-  return game.players.filter((p) => p.alive);
+async function ensureProfile(userId, name) {
+  await pool.query(
+    `
+    INSERT INTO user_profiles (user_id, name)
+    VALUES ($1, $2)
+    ON CONFLICT (user_id)
+    DO UPDATE SET name = EXCLUDED.name, updated_at = NOW()
+    `,
+    [String(userId), name]
+  );
 }
 
-function getAliveInfected(game) {
-  return game.players.filter((p) => p.alive && p.role === "infected");
+async function getProfile(userId, name = "Игрок") {
+  await ensureProfile(userId, name);
+  const res = await pool.query(
+    `SELECT * FROM user_profiles WHERE user_id = $1 LIMIT 1`,
+    [String(userId)]
+  );
+  return res.rows[0];
 }
 
-function getAliveNonInfected(game) {
-  return game.players.filter((p) => p.alive && p.role !== "infected");
+async function getLobby(chatId) {
+  const lobbyRes = await pool.query(
+    `SELECT * FROM game_lobbies WHERE chat_id = $1 LIMIT 1`,
+    [String(chatId)]
+  );
+  if (lobbyRes.rows.length === 0) return null;
+
+  const row = lobbyRes.rows[0];
+  const playersRes = await pool.query(
+    `SELECT * FROM game_players WHERE chat_id = $1 ORDER BY joined_at ASC`,
+    [String(chatId)]
+  );
+
+  return {
+    chatId: row.chat_id,
+    creatorId: row.creator_id,
+    creatorName: row.creator_name,
+    started: row.started,
+    phase: row.phase,
+    round: row.round_num,
+    lobbyMessageId: row.lobby_message_id ? Number(row.lobby_message_id) : null,
+    voteMessageId: row.vote_message_id ? Number(row.vote_message_id) : null,
+    voteCountsMessageId: row.vote_counts_message_id ? Number(row.vote_counts_message_id) : null,
+    nightActions: row.night_actions || {
+      infectedByActor: {},
+      doctor: null,
+      scanner: null,
+      guard: null
+    },
+    votes: row.votes || {},
+    players: playersRes.rows.map((p) => ({
+      id: p.user_id,
+      name: p.name,
+      alive: p.alive,
+      role: p.role
+    }))
+  };
 }
 
-function isCreator(game, userId) {
-  return String(game.creatorId) === String(userId);
+async function saveLobby(lobby) {
+  await pool.query(
+    `
+    UPDATE game_lobbies
+    SET
+      started = $2,
+      phase = $3,
+      round_num = $4,
+      lobby_message_id = $5,
+      vote_message_id = $6,
+      vote_counts_message_id = $7,
+      night_actions = $8::jsonb,
+      votes = $9::jsonb,
+      updated_at = NOW()
+    WHERE chat_id = $1
+    `,
+    [
+      String(lobby.chatId),
+      lobby.started,
+      lobby.phase,
+      lobby.round,
+      lobby.lobbyMessageId,
+      lobby.voteMessageId,
+      lobby.voteCountsMessageId,
+      JSON.stringify(lobby.nightActions || {}),
+      JSON.stringify(lobby.votes || {})
+    ]
+  );
 }
 
-function getJoinLink(game) {
-  return `https://t.me/${BOT_USERNAME}?start=join_${game.chatId}`;
+async function savePlayer(chatId, player) {
+  await pool.query(
+    `
+    UPDATE game_players
+    SET name = $3, alive = $4, role = $5
+    WHERE chat_id = $1 AND user_id = $2
+    `,
+    [String(chatId), String(player.id), player.name, player.alive, player.role]
+  );
 }
 
-function buildLobbyText(game) {
-  const playersText = game.players.map((p, i) => `${i + 1}. ${p.name}`).join("\n");
+async function createLobby(chatId, creator) {
+  const creatorName = getDisplayName(creator);
+  await ensureProfile(creator.id, creatorName);
+
+  await pool.query(
+    `
+    INSERT INTO game_lobbies (
+      chat_id, creator_id, creator_name, started, phase, round_num,
+      lobby_message_id, vote_message_id, vote_counts_message_id,
+      night_actions, votes
+    )
+    VALUES (
+      $1, $2, $3, FALSE, 'lobby', 1,
+      NULL, NULL, NULL,
+      '{"infectedByActor":{},"doctor":null,"scanner":null,"guard":null}'::jsonb,
+      '{}'::jsonb
+    )
+    `,
+    [String(chatId), String(creator.id), creatorName]
+  );
+
+  await pool.query(
+    `
+    INSERT INTO game_players (chat_id, user_id, name, alive, role)
+    VALUES ($1, $2, $3, TRUE, NULL)
+    `,
+    [String(chatId), String(creator.id), creatorName]
+  );
+
+  return getLobby(chatId);
+}
+
+async function deleteLobby(chatId) {
+  await pool.query(`DELETE FROM game_lobbies WHERE chat_id = $1`, [String(chatId)]);
+}
+
+function getPlayer(lobby, userId) {
+  return lobby.players.find((p) => String(p.id) === String(userId));
+}
+
+function getAlivePlayers(lobby) {
+  return lobby.players.filter((p) => p.alive);
+}
+
+function getAliveInfected(lobby) {
+  return lobby.players.filter((p) => p.alive && p.role === "infected");
+}
+
+function getAliveNonInfected(lobby) {
+  return lobby.players.filter((p) => p.alive && p.role !== "infected");
+}
+
+function isCreator(lobby, userId) {
+  return String(lobby.creatorId) === String(userId);
+}
+
+function getJoinLink(chatId) {
+  return `https://t.me/${BOT_USERNAME}?start=join_${chatId}`;
+}
+
+function buildLobbyText(lobby) {
+  const playersText = lobby.players.map((p, i) => `${i + 1}. ${p.name}`).join("\n");
 
   return (
     `🧪 *Лобби "Заражение"*\n\n` +
-    `Создатель: ${game.creatorName}\n\n` +
+    `Создатель: ${lobby.creatorName}\n\n` +
     `*Игроки:*\n${playersText}\n\n` +
-    `Ссылка для входа:\n${getJoinLink(game)}\n\n` +
+    `Ссылка для входа:\n${getJoinLink(lobby.chatId)}\n\n` +
     `Нажми кнопку *Играть* ниже или перейди по ссылке.\n` +
     `После нажатия *Start* бот автоматически добавит тебя в список игроков.\n\n` +
     `Для старта нужно минимум 4 игрока.\n` +
@@ -132,236 +297,201 @@ function buildLobbyText(game) {
   );
 }
 
-function buildLobbyKeyboard(game) {
+function buildLobbyKeyboard(lobby) {
   return {
-    inline_keyboard: [
-      [
-        {
-          text: "🎮 Играть",
-          url: getJoinLink(game)
-        }
-      ]
-    ]
+    inline_keyboard: [[{ text: "🎮 Играть", url: getJoinLink(lobby.chatId) }]]
   };
 }
 
-async function renderLobbyMessage(game) {
-  if (!game.lobbyMessageId) return;
-
+async function renderLobbyMessage(lobby) {
+  if (!lobby.lobbyMessageId) return;
   try {
-    await bot.editMessageText(buildLobbyText(game), {
-      chat_id: game.chatId,
-      message_id: game.lobbyMessageId,
+    await bot.editMessageText(buildLobbyText(lobby), {
+      chat_id: lobby.chatId,
+      message_id: lobby.lobbyMessageId,
       parse_mode: "Markdown",
       disable_web_page_preview: true,
-      reply_markup: buildLobbyKeyboard(game)
+      reply_markup: buildLobbyKeyboard(lobby)
     });
-  } catch (error) {
-    console.log("Ошибка обновления лобби:", error.message);
+  } catch (e) {
+    console.log("edit lobby:", e.message);
   }
-}
-
-function getRolesForCount(count) {
-  if (count < 4) return null;
-
-  if (count === 4) {
-    return ["infected", "doctor", "scanner", "civilian"];
-  }
-
-  if (count === 5) {
-    return ["infected", "doctor", "scanner", "civilian", "civilian"];
-  }
-
-  if (count === 6) {
-    return ["infected", "doctor", "scanner", "guard", "civilian", "civilian"];
-  }
-
-  if (count === 7) {
-    return ["infected", "infected", "doctor", "scanner", "guard", "civilian", "civilian"];
-  }
-
-  return ["infected", "infected", "doctor", "scanner", "guard", "civilian", "civilian", "civilian"];
 }
 
 async function sendRole(player) {
   try {
     await bot.sendMessage(player.id, roleDescription(player.role));
-  } catch (error) {
-    console.log(`Не удалось отправить роль игроку ${player.id}:`, error.message);
+  } catch (e) {
+    console.log("send role:", e.message);
   }
 }
 
-function buildFinalRolesText(game) {
-  return game.players
+function buildFinalRolesText(lobby) {
+  return lobby.players
     .map((p, i) => `${i + 1}. ${p.name} — ${roleNameRu(p.role)} (${p.alive ? "жив" : "выбыл"})`)
     .join("\n");
 }
 
-function checkWinner(game) {
-  const infected = getAliveInfected(game).length;
-  const nonInfected = getAliveNonInfected(game).length;
+function checkWinner(lobby) {
+  const infected = getAliveInfected(lobby).length;
+  const nonInfected = getAliveNonInfected(lobby).length;
 
   if (infected === 0) return "civilian";
   if (infected >= nonInfected) return "infected";
-
   return null;
 }
 
-function rewardPlayers(game, winner) {
-  const rewardLines = [];
+async function rewardPlayers(lobby, winner) {
+  const lines = [];
 
-  for (const player of game.players) {
-    const profile = getProfile(player.id, player.name);
-    profile.games += 1;
-
+  for (const player of lobby.players) {
     let reward = 0;
-
-    if (player.alive) {
-      reward += 10;
-      profile.survived += 1;
-    }
 
     const isWinner =
       (winner === "infected" && player.role === "infected") ||
       (winner === "civilian" && player.role !== "infected");
 
-    if (isWinner) {
-      reward += 10;
-      profile.wins += 1;
-    }
+    if (player.alive) reward += 10;
+    if (isWinner) reward += 10;
 
-    profile.coins += reward;
-    rewardLines.push(`${player.name} — +${reward} монет`);
+    await pool.query(
+      `
+      INSERT INTO user_profiles (user_id, name, coins, games, wins, survived)
+      VALUES ($1, $2, $3, 1, $4, $5)
+      ON CONFLICT (user_id)
+      DO UPDATE SET
+        name = EXCLUDED.name,
+        coins = user_profiles.coins + $3,
+        games = user_profiles.games + 1,
+        wins = user_profiles.wins + $4,
+        survived = user_profiles.survived + $5,
+        updated_at = NOW()
+      `,
+      [
+        String(player.id),
+        player.name,
+        reward,
+        isWinner ? 1 : 0,
+        player.alive ? 1 : 0
+      ]
+    );
+
+    lines.push(`${player.name} — +${reward} монет`);
   }
 
-  return rewardLines.join("\n");
+  return lines.join("\n");
 }
 
-async function finishGame(game, winner) {
-  game.phase = "ended";
+async function finishGame(lobby, winner) {
+  lobby.phase = "ended";
+  await saveLobby(lobby);
 
+  const rewardsText = await rewardPlayers(lobby, winner);
   const winText =
     winner === "infected"
       ? `🦠 *Победа заражённых!*`
       : `🙂 *Победа мирных!*`;
 
-  const rewardsText = rewardPlayers(game, winner);
-
   await bot.sendMessage(
-    game.chatId,
-    `${winText}\n\n*Игроки и роли:*\n${buildFinalRolesText(game)}\n\n*Награды:*\n${rewardsText}`,
+    lobby.chatId,
+    `${winText}\n\n*Игроки и роли:*\n${buildFinalRolesText(lobby)}\n\n*Награды:*\n${rewardsText}`,
     { parse_mode: "Markdown" }
   );
 
-  games.delete(String(game.chatId));
+  await deleteLobby(lobby.chatId);
 }
 
-function createNightKeyboard(game, actorId, action) {
-  const alivePlayers = getAlivePlayers(game).filter((p) => String(p.id) !== String(actorId));
-
+function createNightKeyboard(lobby, actorId, action) {
+  const alivePlayers = getAlivePlayers(lobby).filter((p) => String(p.id) !== String(actorId));
   return {
     inline_keyboard: alivePlayers.map((p) => [
-      {
-        text: p.name,
-        callback_data: `night:${action}:${game.chatId}:${p.id}`
-      }
+      { text: p.name, callback_data: `night:${action}:${lobby.chatId}:${p.id}` }
     ])
   };
 }
 
-function allNightActionsDone(game) {
-  const alivePlayers = getAlivePlayers(game);
+function allNightActionsDone(lobby) {
+  const alive = getAlivePlayers(lobby);
+  const infectedAlive = alive.filter((p) => p.role === "infected").length;
+  const doctorAlive = alive.some((p) => p.role === "doctor");
+  const scannerAlive = alive.some((p) => p.role === "scanner");
+  const guardAlive = alive.some((p) => p.role === "guard");
 
-  const infectedAlive = alivePlayers.filter((p) => p.role === "infected").length;
-  const doctorAlive = alivePlayers.some((p) => p.role === "doctor");
-  const scannerAlive = alivePlayers.some((p) => p.role === "scanner");
-  const guardAlive = alivePlayers.some((p) => p.role === "guard");
-
-  const infectedDone = Object.keys(game.nightActions.infectedByActor).length >= infectedAlive;
-  const doctorDone = !doctorAlive || game.nightActions.doctor !== null;
-  const scannerDone = !scannerAlive || game.nightActions.scanner !== null;
-  const guardDone = !guardAlive || game.nightActions.guard !== null;
+  const infectedDone = Object.keys(lobby.nightActions.infectedByActor || {}).length >= infectedAlive;
+  const doctorDone = !doctorAlive || lobby.nightActions.doctor !== null;
+  const scannerDone = !scannerAlive || lobby.nightActions.scanner !== null;
+  const guardDone = !guardAlive || lobby.nightActions.guard !== null;
 
   return infectedDone && doctorDone && scannerDone && guardDone;
 }
 
-async function maybeFinishNight(game) {
-  if (!allNightActionsDone(game)) return;
-  await finishNight(game);
+async function maybeFinishNight(lobby) {
+  if (!allNightActionsDone(lobby)) return;
+  await finishNight(lobby);
 }
 
-async function startNight(game) {
-  game.phase = "night";
-  game.nightActions = {
+async function startNight(lobby) {
+  lobby.phase = "night";
+  lobby.nightActions = {
     infectedByActor: {},
     doctor: null,
     scanner: null,
     guard: null
   };
-  game.votes = {};
-  game.voteCountsMessageId = null;
-  game.voteMessageId = null;
+  lobby.votes = {};
+  lobby.voteMessageId = null;
+  lobby.voteCountsMessageId = null;
+  await saveLobby(lobby);
 
   await bot.sendMessage(
-    game.chatId,
-    `🌙 *Ночь ${game.round}*\n\nНочные роли, проверьте личные сообщения.`,
+    lobby.chatId,
+    `🌙 *Ночь ${lobby.round}*\n\nНочные роли, проверьте личные сообщения.`,
     { parse_mode: "Markdown" }
   );
 
-  for (const player of getAlivePlayers(game)) {
+  for (const player of getAlivePlayers(lobby)) {
     try {
       if (player.role === "infected") {
-        await bot.sendMessage(
-          player.id,
-          `🌙 Ночь ${game.round}\nВыбери, кого заразить:`,
-          { reply_markup: createNightKeyboard(game, player.id, "infect") }
-        );
+        await bot.sendMessage(player.id, `🌙 Ночь ${lobby.round}\nВыбери, кого заразить:`, {
+          reply_markup: createNightKeyboard(lobby, player.id, "infect")
+        });
       } else if (player.role === "doctor") {
-        await bot.sendMessage(
-          player.id,
-          `🌙 Ночь ${game.round}\nВыбери, кого лечить:`,
-          { reply_markup: createNightKeyboard(game, player.id, "heal") }
-        );
+        await bot.sendMessage(player.id, `🌙 Ночь ${lobby.round}\nВыбери, кого лечить:`, {
+          reply_markup: createNightKeyboard(lobby, player.id, "heal")
+        });
       } else if (player.role === "scanner") {
-        await bot.sendMessage(
-          player.id,
-          `🌙 Ночь ${game.round}\nВыбери, кого проверить:`,
-          { reply_markup: createNightKeyboard(game, player.id, "scan") }
-        );
+        await bot.sendMessage(player.id, `🌙 Ночь ${lobby.round}\nВыбери, кого проверить:`, {
+          reply_markup: createNightKeyboard(lobby, player.id, "scan")
+        });
       } else if (player.role === "guard") {
-        await bot.sendMessage(
-          player.id,
-          `🌙 Ночь ${game.round}\nВыбери, кого защитить:`,
-          { reply_markup: createNightKeyboard(game, player.id, "guard") }
-        );
+        await bot.sendMessage(player.id, `🌙 Ночь ${lobby.round}\nВыбери, кого защитить:`, {
+          reply_markup: createNightKeyboard(lobby, player.id, "guard")
+        });
       }
-    } catch (error) {
-      console.log("Ошибка отправки ночного действия:", error.message);
+    } catch (e) {
+      console.log("night msg:", e.message);
     }
   }
 
-  await maybeFinishNight(game);
+  await maybeFinishNight(lobby);
 }
 
-async function finishNight(game) {
-  if (game.phase !== "night") return;
+async function finishNight(lobby) {
+  if (lobby.phase !== "night") return;
 
-  const infectedChoices = Object.values(game.nightActions.infectedByActor);
-  const doctorTarget = game.nightActions.doctor;
-  const scannerTarget = game.nightActions.scanner;
-  const guardTarget = game.nightActions.guard;
+  const infectedChoices = Object.values(lobby.nightActions.infectedByActor || {});
+  const doctorTarget = lobby.nightActions.doctor;
+  const scannerTarget = lobby.nightActions.scanner;
+  const guardTarget = lobby.nightActions.guard;
 
   let finalTarget = null;
 
   if (infectedChoices.length > 0) {
     const counts = {};
-    for (const targetId of infectedChoices) {
-      counts[targetId] = (counts[targetId] || 0) + 1;
-    }
+    for (const t of infectedChoices) counts[t] = (counts[t] || 0) + 1;
 
     let maxVotes = 0;
     let hasTie = false;
-
     for (const [targetId, votes] of Object.entries(counts)) {
       if (votes > maxVotes) {
         maxVotes = votes;
@@ -371,45 +501,40 @@ async function finishNight(game) {
         hasTie = true;
       }
     }
-
-    if (hasTie) {
-      finalTarget = null;
-    }
+    if (hasTie) finalTarget = null;
   }
 
   if (scannerTarget !== null) {
-    const scanner = getAlivePlayers(game).find((p) => p.role === "scanner");
-    const checkedPlayer = getPlayer(game, scannerTarget);
-
-    if (scanner && checkedPlayer) {
+    const scanner = getAlivePlayers(lobby).find((p) => p.role === "scanner");
+    const checked = getPlayer(lobby, scannerTarget);
+    if (scanner && checked) {
       try {
-        if (checkedPlayer.role === "infected") {
-          await bot.sendMessage(scanner.id, `🔎 Проверка: ${checkedPlayer.name} — заражённый.`);
-        } else {
-          await bot.sendMessage(scanner.id, `🔎 Проверка: ${checkedPlayer.name} — не заражённый.`);
-        }
-      } catch (error) {
-        console.log("Ошибка отправки результата сканеру:", error.message);
+        await bot.sendMessage(
+          scanner.id,
+          checked.role === "infected"
+            ? `🔎 Проверка: ${checked.name} — заражённый.`
+            : `🔎 Проверка: ${checked.name} — не заражённый.`
+        );
+      } catch (e) {
+        console.log("scanner result:", e.message);
       }
     }
   }
 
-  let text = `☀ *День ${game.round}*\n\n`;
+  let text = `☀ *День ${lobby.round}*\n\n`;
 
   if (!finalTarget) {
     text += `Ночью ничего не произошло.`;
   } else if (finalTarget === doctorTarget || finalTarget === guardTarget) {
-    const saved = getPlayer(game, finalTarget);
-    if (saved) {
-      text += `Ночью попытка заражения была остановлена.\n${saved.name} удалось спасти.`;
-    } else {
-      text += `Ночью попытка заражения была остановлена.`;
-    }
+    const saved = getPlayer(lobby, finalTarget);
+    text += saved
+      ? `Ночью попытка заражения была остановлена.\n${saved.name} удалось спасти.`
+      : `Ночью попытка заражения была остановлена.`;
   } else {
-    const victim = getPlayer(game, finalTarget);
-
+    const victim = getPlayer(lobby, finalTarget);
     if (victim && victim.alive && victim.role !== "infected") {
       victim.role = "infected";
+      await savePlayer(lobby.chatId, victim);
       text += `Ночью был заражён игрок: ${victim.name}`;
 
       try {
@@ -417,66 +542,55 @@ async function finishNight(game) {
           victim.id,
           `🦠 Ты был заражён.\nТеперь твоя роль — Заражённый.\nСледующей ночью ты сможешь делать ход.`
         );
-      } catch (error) {
-        console.log("Ошибка отправки заражённому:", error.message);
+      } catch (e) {
+        console.log("infected notify:", e.message);
       }
     } else {
       text += `Ночью ничего не произошло.`;
     }
   }
 
-  await bot.sendMessage(game.chatId, text, { parse_mode: "Markdown" });
+  await bot.sendMessage(lobby.chatId, text, { parse_mode: "Markdown" });
 
-  const winner = checkWinner(game);
+  const winner = checkWinner(lobby);
   if (winner) {
-    await finishGame(game, winner);
+    await finishGame(lobby, winner);
     return;
   }
 
-  await startVoting(game);
+  await startVoting(lobby);
 }
 
-function buildVotingKeyboard(game) {
-  const alivePlayers = getAlivePlayers(game);
-
+function buildVotingKeyboard(lobby) {
+  const alivePlayers = getAlivePlayers(lobby);
   return {
     inline_keyboard: [
       ...alivePlayers.map((p) => [
-        {
-          text: p.name,
-          callback_data: `vote:${game.chatId}:${p.id}`
-        }
+        { text: p.name, callback_data: `vote:${lobby.chatId}:${p.id}` }
       ]),
-      [
-        {
-          text: "⏭ Пропуск",
-          callback_data: `vote:${game.chatId}:skip`
-        }
-      ]
+      [{ text: "⏭ Пропуск", callback_data: `vote:${lobby.chatId}:skip` }]
     ]
   };
 }
 
-function allAliveVoted(game) {
-  return getAlivePlayers(game).every((p) => game.votes[String(p.id)] !== undefined);
+function allAliveVoted(lobby) {
+  return getAlivePlayers(lobby).every((p) => lobby.votes[String(p.id)] !== undefined);
 }
 
-function getVoteCountText(game) {
-  const alivePlayers = getAlivePlayers(game);
+function getVoteCountText(lobby) {
+  const alivePlayers = getAlivePlayers(lobby);
   const lines = [];
 
   for (const player of alivePlayers) {
     let count = 0;
-    for (const vote of Object.values(game.votes)) {
-      if (String(vote) === String(player.id)) {
-        count += 1;
-      }
+    for (const vote of Object.values(lobby.votes)) {
+      if (String(vote) === String(player.id)) count += 1;
     }
     lines.push(`${player.name} — ${count}`);
   }
 
   let skipCount = 0;
-  for (const vote of Object.values(game.votes)) {
+  for (const vote of Object.values(lobby.votes)) {
     if (vote === "skip") skipCount += 1;
   }
   lines.push(`Пропуск — ${skipCount}`);
@@ -484,52 +598,52 @@ function getVoteCountText(game) {
   return `📊 *Голоса сейчас:*\n${lines.join("\n")}`;
 }
 
-async function updateVoteCountMessage(game) {
-  if (!game.voteCountsMessageId) return;
-
+async function updateVoteCountMessage(lobby) {
+  if (!lobby.voteCountsMessageId) return;
   try {
-    await bot.editMessageText(getVoteCountText(game), {
-      chat_id: game.chatId,
-      message_id: game.voteCountsMessageId,
+    await bot.editMessageText(getVoteCountText(lobby), {
+      chat_id: lobby.chatId,
+      message_id: lobby.voteCountsMessageId,
       parse_mode: "Markdown"
     });
-  } catch (error) {
-    console.log("Ошибка обновления счетчика голосов:", error.message);
+  } catch (e) {
+    console.log("edit votes:", e.message);
   }
 }
 
-async function startVoting(game) {
-  game.phase = "voting";
-  game.votes = {};
+async function startVoting(lobby) {
+  lobby.phase = "voting";
+  lobby.votes = {};
+  await saveLobby(lobby);
 
   const voteMsg = await bot.sendMessage(
-    game.chatId,
+    lobby.chatId,
     `📦 *Голосование*\n\nВыберите, кого изгнать.`,
     {
       parse_mode: "Markdown",
-      reply_markup: buildVotingKeyboard(game)
+      reply_markup: buildVotingKeyboard(lobby)
     }
   );
-
-  game.voteMessageId = voteMsg.message_id;
+  lobby.voteMessageId = voteMsg.message_id;
 
   const countsMsg = await bot.sendMessage(
-    game.chatId,
-    getVoteCountText(game),
+    lobby.chatId,
+    getVoteCountText(lobby),
     { parse_mode: "Markdown" }
   );
+  lobby.voteCountsMessageId = countsMsg.message_id;
 
-  game.voteCountsMessageId = countsMsg.message_id;
+  await saveLobby(lobby);
 }
 
-async function finishVoting(game) {
-  if (game.phase !== "voting") return;
+async function finishVoting(lobby) {
+  if (lobby.phase !== "voting") return;
 
-  game.phase = "voting_finished";
+  lobby.phase = "voting_finished";
+  await saveLobby(lobby);
 
   const counts = {};
-
-  for (const target of Object.values(game.votes)) {
+  for (const target of Object.values(lobby.votes)) {
     counts[target] = (counts[target] || 0) + 1;
   }
 
@@ -552,59 +666,52 @@ async function finishVoting(game) {
   if (!selected || hasTie || selected === "skip") {
     text += `Никто не был изгнан.`;
   } else {
-    const player = getPlayer(game, selected);
-
+    const player = getPlayer(lobby, selected);
     if (player && player.alive) {
       player.alive = false;
+      await savePlayer(lobby.chatId, player);
       text += `Изгнан игрок: ${player.name}\nРоль игрока: *${roleNameRu(player.role)}*`;
     } else {
       text += `Никто не был изгнан.`;
     }
   }
 
-  await bot.sendMessage(game.chatId, text, { parse_mode: "Markdown" });
+  await bot.sendMessage(lobby.chatId, text, { parse_mode: "Markdown" });
 
-  const winner = checkWinner(game);
+  const winner = checkWinner(lobby);
   if (winner) {
-    await finishGame(game, winner);
+    await finishGame(lobby, winner);
     return;
   }
 
-  game.round += 1;
-  await startNight(game);
+  lobby.round += 1;
+  await saveLobby(lobby);
+  await startNight(lobby);
 }
 
-async function addUserToGame(user, chatId) {
-  const game = getGame(chatId);
+async function addUserToLobby(user, chatId) {
+  const lobby = await getLobby(chatId);
 
-  if (!game) {
-    return { ok: false, text: "Лобби не найдено или игра уже закончилась." };
-  }
+  if (!lobby) return { ok: false, text: "Лобби не найдено или игра уже закончилась." };
+  if (lobby.started) return { ok: false, text: "Игра уже началась. Войти нельзя." };
+  if (lobby.players.length >= 8) return { ok: false, text: "Лобби уже заполнено." };
 
-  if (game.started) {
-    return { ok: false, text: "Игра уже началась. Войти нельзя." };
-  }
-
-  if (game.players.length >= 8) {
-    return { ok: false, text: "Лобби уже заполнено." };
-  }
-
-  const already = getPlayer(game, user.id);
-  if (already) {
-    return { ok: true, text: "Ты уже есть в этом лобби." };
-  }
+  const already = getPlayer(lobby, user.id);
+  if (already) return { ok: true, text: "Ты уже есть в этом лобби." };
 
   const name = getDisplayName(user);
-  updateProfileName(user.id, name);
+  await ensureProfile(user.id, name);
 
-  game.players.push({
-    id: String(user.id),
-    name,
-    alive: true,
-    role: null
-  });
+  await pool.query(
+    `
+    INSERT INTO game_players (chat_id, user_id, name, alive, role)
+    VALUES ($1, $2, $3, TRUE, NULL)
+    `,
+    [String(chatId), String(user.id), name]
+  );
 
-  await renderLobbyMessage(game);
+  const freshLobby = await getLobby(chatId);
+  await renderLobbyMessage(freshLobby);
 
   return { ok: true, text: `✅ Ты добавлен в игру.\nТвой ник: ${name}` };
 }
@@ -616,13 +723,13 @@ bot.onText(/^\/start(?:\s+(.+))?$/, async (msg, match) => {
       return;
     }
 
-    const payload = match && match[1] ? match[1].trim() : "";
     const name = getDisplayName(msg.from);
-    updateProfileName(msg.from.id, name);
+    await ensureProfile(msg.from.id, name);
 
+    const payload = match && match[1] ? match[1].trim() : "";
     if (payload.startsWith("join_")) {
       const chatId = payload.replace("join_", "");
-      const result = await addUserToGame(msg.from, chatId);
+      const result = await addUserToLobby(msg.from, chatId);
       await bot.sendMessage(msg.chat.id, result.text);
       return;
     }
@@ -632,8 +739,8 @@ bot.onText(/^\/start(?:\s+(.+))?$/, async (msg, match) => {
       `Привет, ${name}!\n\nНажми кнопку *Играть* в группе или открой ссылку из лобби.`,
       { parse_mode: "Markdown" }
     );
-  } catch (error) {
-    console.log("/start error:", error.message);
+  } catch (e) {
+    console.log("/start:", e.message);
   }
 });
 
@@ -644,55 +751,24 @@ bot.onText(/^\/create_game$/, async (msg) => {
       return;
     }
 
-    const chatId = String(msg.chat.id);
-
-    if (games.has(chatId)) {
+    const existing = await getLobby(msg.chat.id);
+    if (existing) {
       await bot.sendMessage(msg.chat.id, "В этой группе уже есть активная игра.");
       return;
     }
 
-    const creator = msg.from;
-    const creatorName = getDisplayName(creator);
-    updateProfileName(creator.id, creatorName);
+    const lobby = await createLobby(msg.chat.id, msg.from);
 
-    const game = {
-      chatId,
-      creatorId: String(creator.id),
-      creatorName,
-      players: [
-        {
-          id: String(creator.id),
-          name: creatorName,
-          alive: true,
-          role: null
-        }
-      ],
-      started: false,
-      phase: "lobby",
-      round: 1,
-      lobbyMessageId: null,
-      voteMessageId: null,
-      voteCountsMessageId: null,
-      nightActions: {
-        infectedByActor: {},
-        doctor: null,
-        scanner: null,
-        guard: null
-      },
-      votes: {}
-    };
-
-    games.set(chatId, game);
-
-    const sent = await bot.sendMessage(msg.chat.id, buildLobbyText(game), {
+    const sent = await bot.sendMessage(msg.chat.id, buildLobbyText(lobby), {
       parse_mode: "Markdown",
       disable_web_page_preview: true,
-      reply_markup: buildLobbyKeyboard(game)
+      reply_markup: buildLobbyKeyboard(lobby)
     });
 
-    game.lobbyMessageId = sent.message_id;
-  } catch (error) {
-    console.log("/create_game error:", error.message);
+    lobby.lobbyMessageId = sent.message_id;
+    await saveLobby(lobby);
+  } catch (e) {
+    console.log("/create_game:", e.message);
     await bot.sendMessage(msg.chat.id, "Ошибка создания игры.");
   }
 });
@@ -704,41 +780,44 @@ bot.onText(/^\/startgame$/, async (msg) => {
       return;
     }
 
-    const game = getGame(msg.chat.id);
+    const lobby = await getLobby(msg.chat.id);
 
-    if (!game) {
+    if (!lobby) {
       await bot.sendMessage(msg.chat.id, "Сначала создай игру через /create_game");
       return;
     }
 
-    if (!isCreator(game, msg.from.id)) {
+    if (!isCreator(lobby, msg.from.id)) {
       await bot.sendMessage(msg.chat.id, "Начать игру может только создатель.");
       return;
     }
 
-    if (game.started) {
+    if (lobby.started) {
       await bot.sendMessage(msg.chat.id, "Игра уже началась.");
       return;
     }
 
-    const roles = getRolesForCount(game.players.length);
+    const roles = getRolesForCount(lobby.players.length);
     if (!roles) {
       await bot.sendMessage(msg.chat.id, "Для старта нужно минимум 4 игрока.");
       return;
     }
 
-    game.started = true;
+    lobby.started = true;
 
-    const shuffledPlayers = shuffle(game.players);
+    const shuffledPlayers = shuffle(lobby.players);
     const shuffledRoles = shuffle(roles);
 
     for (let i = 0; i < shuffledPlayers.length; i++) {
       shuffledPlayers[i].role = shuffledRoles[i] || "civilian";
+      await savePlayer(lobby.chatId, shuffledPlayers[i]);
     }
+
+    await saveLobby(lobby);
 
     await bot.sendMessage(
       msg.chat.id,
-      `🎮 *Игра началась!*\n\nИгроков: ${game.players.length}\nРоли отправлены в личные сообщения.`,
+      `🎮 *Игра началась!*\n\nИгроков: ${lobby.players.length}\nРоли отправлены в личные сообщения.`,
       { parse_mode: "Markdown" }
     );
 
@@ -746,70 +825,105 @@ bot.onText(/^\/startgame$/, async (msg) => {
       await sendRole(player);
     }
 
-    await startNight(game);
-  } catch (error) {
-    console.log("/startgame error:", error.message);
+    const freshLobby = await getLobby(msg.chat.id);
+    await startNight(freshLobby);
+  } catch (e) {
+    console.log("/startgame:", e.message);
     await bot.sendMessage(msg.chat.id, "Ошибка запуска игры.");
   }
 });
 
 bot.onText(/^\/cancel_game$/, async (msg) => {
   try {
-    const game = getGame(msg.chat.id);
+    const lobby = await getLobby(msg.chat.id);
 
-    if (!game) {
+    if (!lobby) {
       await bot.sendMessage(msg.chat.id, "Активной игры нет.");
       return;
     }
 
-    if (!isCreator(game, msg.from.id)) {
+    if (!isCreator(lobby, msg.from.id)) {
       await bot.sendMessage(msg.chat.id, "Отменить игру может только создатель.");
       return;
     }
 
-    games.delete(String(msg.chat.id));
+    await deleteLobby(msg.chat.id);
     await bot.sendMessage(msg.chat.id, "Игра отменена.");
-  } catch (error) {
-    console.log("/cancel_game error:", error.message);
+  } catch (e) {
+    console.log("/cancel_game:", e.message);
     await bot.sendMessage(msg.chat.id, "Ошибка отмены игры.");
   }
 });
 
-bot.onText(/^\/profile$/, async (msg) => {
-  const name = getDisplayName(msg.from);
-  const profile = updateProfileName(msg.from.id, name);
+bot.onText(/^\/finishvote$/, async (msg) => {
+  try {
+    const lobby = await getLobby(msg.chat.id);
 
-  await bot.sendMessage(
-    msg.chat.id,
-    `👤 *Профиль*\n\n` +
-      `Имя: ${profile.name}\n` +
-      `Монеты: ${profile.coins}\n` +
-      `Игр: ${profile.games}\n` +
-      `Побед: ${profile.wins}\n` +
-      `Выжил: ${profile.survived}`,
-    { parse_mode: "Markdown" }
-  );
+    if (!lobby) {
+      await bot.sendMessage(msg.chat.id, "Активной игры нет.");
+      return;
+    }
+
+    if (!isCreator(lobby, msg.from.id)) {
+      await bot.sendMessage(msg.chat.id, "Завершить голосование может только создатель.");
+      return;
+    }
+
+    if (lobby.phase !== "voting") {
+      await bot.sendMessage(msg.chat.id, "Сейчас нет активного голосования.");
+      return;
+    }
+
+    await finishVoting(lobby);
+  } catch (e) {
+    console.log("/finishvote:", e.message);
+    await bot.sendMessage(msg.chat.id, "Ошибка завершения голосования.");
+  }
+});
+
+bot.onText(/^\/profile$/, async (msg) => {
+  try {
+    const name = getDisplayName(msg.from);
+    const profile = await getProfile(msg.from.id, name);
+
+    await bot.sendMessage(
+      msg.chat.id,
+      `👤 *Профиль*\n\n` +
+        `Имя: ${profile.name}\n` +
+        `Монеты: ${profile.coins}\n` +
+        `Игр: ${profile.games}\n` +
+        `Побед: ${profile.wins}\n` +
+        `Выжил: ${profile.survived}`,
+      { parse_mode: "Markdown" }
+    );
+  } catch (e) {
+    console.log("/profile:", e.message);
+  }
 });
 
 bot.onText(/^\/top$/, async (msg) => {
-  const top = [...profiles.values()]
-    .sort((a, b) => b.coins - a.coins)
-    .slice(0, 10);
+  try {
+    const res = await pool.query(
+      `SELECT name, coins FROM user_profiles ORDER BY coins DESC, name ASC LIMIT 10`
+    );
 
-  if (top.length === 0) {
-    await bot.sendMessage(msg.chat.id, "Топ пока пуст.");
-    return;
+    if (res.rows.length === 0) {
+      await bot.sendMessage(msg.chat.id, "Топ пока пуст.");
+      return;
+    }
+
+    const text = res.rows
+      .map((p, i) => `${i + 1}. ${p.name} — ${p.coins} монет`)
+      .join("\n");
+
+    await bot.sendMessage(
+      msg.chat.id,
+      `🏆 *Топ игроков*\n\n${text}`,
+      { parse_mode: "Markdown" }
+    );
+  } catch (e) {
+    console.log("/top:", e.message);
   }
-
-  const text = top
-    .map((p, i) => `${i + 1}. ${p.name} — ${p.coins} монет`)
-    .join("\n");
-
-  await bot.sendMessage(
-    msg.chat.id,
-    `🏆 *Топ игроков*\n\n${text}`,
-    { parse_mode: "Markdown" }
-  );
 });
 
 bot.on("callback_query", async (query) => {
@@ -819,15 +933,20 @@ bot.on("callback_query", async (query) => {
 
     if (data.startsWith("night:")) {
       const [, action, chatId, targetId] = data.split(":");
-      const game = getGame(chatId);
+      const lobby = await getLobby(chatId);
 
-      if (!game || game.phase !== "night") {
+      if (!lobby) {
+        await bot.answerCallbackQuery(query.id, { text: "Игра не найдена." });
+        return;
+      }
+
+      if (lobby.phase !== "night") {
         await bot.answerCallbackQuery(query.id, { text: "Ночь уже закончилась." });
         return;
       }
 
-      const actor = getPlayer(game, fromId);
-      const target = getPlayer(game, targetId);
+      const actor = getPlayer(lobby, fromId);
+      const target = getPlayer(lobby, targetId);
 
       if (!actor || !actor.alive) {
         await bot.answerCallbackQuery(query.id, { text: "Ты не участвуешь в игре." });
@@ -844,13 +963,12 @@ bot.on("callback_query", async (query) => {
           await bot.answerCallbackQuery(query.id, { text: "Это не твоя роль." });
           return;
         }
-
-        if (game.nightActions.infectedByActor[fromId]) {
+        if (lobby.nightActions.infectedByActor[fromId]) {
           await bot.answerCallbackQuery(query.id, { text: "Ты уже сделал ход." });
           return;
         }
-
-        game.nightActions.infectedByActor[fromId] = String(targetId);
+        lobby.nightActions.infectedByActor[fromId] = String(targetId);
+        await saveLobby(lobby);
         await bot.answerCallbackQuery(query.id, { text: `Ты выбрал ${target.name}` });
       }
 
@@ -859,13 +977,12 @@ bot.on("callback_query", async (query) => {
           await bot.answerCallbackQuery(query.id, { text: "Это не твоя роль." });
           return;
         }
-
-        if (game.nightActions.doctor !== null) {
+        if (lobby.nightActions.doctor !== null) {
           await bot.answerCallbackQuery(query.id, { text: "Ты уже сделал ход." });
           return;
         }
-
-        game.nightActions.doctor = String(targetId);
+        lobby.nightActions.doctor = String(targetId);
+        await saveLobby(lobby);
         await bot.answerCallbackQuery(query.id, { text: `Ты лечишь ${target.name}` });
       }
 
@@ -874,13 +991,12 @@ bot.on("callback_query", async (query) => {
           await bot.answerCallbackQuery(query.id, { text: "Это не твоя роль." });
           return;
         }
-
-        if (game.nightActions.scanner !== null) {
+        if (lobby.nightActions.scanner !== null) {
           await bot.answerCallbackQuery(query.id, { text: "Ты уже сделал ход." });
           return;
         }
-
-        game.nightActions.scanner = String(targetId);
+        lobby.nightActions.scanner = String(targetId);
+        await saveLobby(lobby);
         await bot.answerCallbackQuery(query.id, { text: `Ты проверяешь ${target.name}` });
       }
 
@@ -889,93 +1005,99 @@ bot.on("callback_query", async (query) => {
           await bot.answerCallbackQuery(query.id, { text: "Это не твоя роль." });
           return;
         }
-
-        if (game.nightActions.guard !== null) {
+        if (lobby.nightActions.guard !== null) {
           await bot.answerCallbackQuery(query.id, { text: "Ты уже сделал ход." });
           return;
         }
-
-        game.nightActions.guard = String(targetId);
+        lobby.nightActions.guard = String(targetId);
+        await saveLobby(lobby);
         await bot.answerCallbackQuery(query.id, { text: `Ты защищаешь ${target.name}` });
       }
 
-      await maybeFinishNight(game);
+      const freshLobby = await getLobby(chatId);
+      await maybeFinishNight(freshLobby);
       return;
     }
 
     if (data.startsWith("vote:")) {
       const [, chatId, targetId] = data.split(":");
-      const game = getGame(chatId);
+      const lobby = await getLobby(chatId);
 
-      if (!game) {
+      if (!lobby) {
         await bot.answerCallbackQuery(query.id, { text: "Игра не найдена." });
         return;
       }
 
-      if (game.phase !== "voting") {
+      if (lobby.phase !== "voting") {
         await bot.answerCallbackQuery(query.id, { text: "Голосование уже окончено." });
         return;
       }
 
-      const voter = getPlayer(game, fromId);
+      const voter = getPlayer(lobby, fromId);
 
       if (!voter || !voter.alive) {
         await bot.answerCallbackQuery(query.id, { text: "Ты не можешь голосовать." });
         return;
       }
 
-      if (game.votes[fromId] !== undefined) {
+      if (lobby.votes[fromId] !== undefined) {
         await bot.answerCallbackQuery(query.id, { text: "Ты уже проголосовал." });
         return;
       }
 
       if (targetId === "skip") {
-        game.votes[fromId] = "skip";
+        lobby.votes[fromId] = "skip";
+        await saveLobby(lobby);
         await bot.answerCallbackQuery(query.id, { text: "Ты выбрал пропуск." });
-
         await bot.sendMessage(
-          game.chatId,
+          lobby.chatId,
           `🗳 ${voter.name} проголосовал: *Пропуск*`,
           { parse_mode: "Markdown" }
         );
       } else {
-        const target = getPlayer(game, targetId);
-
+        const target = getPlayer(lobby, targetId);
         if (!target || !target.alive) {
           await bot.answerCallbackQuery(query.id, { text: "Этот игрок уже недоступен." });
           return;
         }
 
-        game.votes[fromId] = String(targetId);
+        lobby.votes[fromId] = String(targetId);
+        await saveLobby(lobby);
         await bot.answerCallbackQuery(query.id, { text: `Ты голосуешь против ${target.name}` });
-
         await bot.sendMessage(
-          game.chatId,
-          `🗳 ${voter.name} проголосовал против ${target.name}`,
-          { parse_mode: "Markdown" }
+          lobby.chatId,
+          `🗳 ${voter.name} проголосовал против ${target.name}`
         );
       }
 
-      await updateVoteCountMessage(game);
+      const freshLobby = await getLobby(chatId);
+      await updateVoteCountMessage(freshLobby);
 
-      if (allAliveVoted(game)) {
-        await finishVoting(game);
+      if (allAliveVoted(freshLobby)) {
+        await finishVoting(freshLobby);
       }
-
       return;
     }
 
     await bot.answerCallbackQuery(query.id);
-  } catch (error) {
-    console.log("callback_query error:", error);
+  } catch (e) {
+    console.log("callback:", e);
     try {
       await bot.answerCallbackQuery(query.id, { text: "Ошибка кнопки." });
-    } catch (e) {
-      console.log("answerCallbackQuery error:", e);
-    }
+    } catch {}
   }
 });
 
-bot.on("polling_error", (error) => {
-  console.log("Polling error:", error);
+bot.on("polling_error", (e) => {
+  console.log("polling:", e);
 });
+
+(async () => {
+  try {
+    await initDb();
+    console.log("DB ready");
+  } catch (e) {
+    console.error("DB init error:", e);
+    process.exit(1);
+  }
+})();
