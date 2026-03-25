@@ -66,7 +66,7 @@ function roleNameRu(role) {
     case "infected":
       return "Заражённый";
     case "doctor":
-      return "Врач";
+      return "Аптекарь";
     case "scanner":
       return "Сканер";
     case "guard":
@@ -81,7 +81,7 @@ function roleDescription(role) {
     case "infected":
       return "🦠 Твоя роль: Заражённый\n\nНочью ты выбираешь, кого заразить.";
     case "doctor":
-      return "💉 Твоя роль: Врач\n\nНочью ты выбираешь, кого лечить.";
+      return "💊 Твоя роль: Аптекарь\n\nНочью ты выбираешь, кого лечить.";
     case "scanner":
       return "🔎 Твоя роль: Сканер\n\nНочью ты проверяешь одного игрока.";
     case "guard":
@@ -109,7 +109,8 @@ function buildLobbyText(lobby) {
     `Ссылка для входа:\n${joinLink}\n\n` +
     `Нажми кнопку *Играть* ниже или перейди по ссылке.\n` +
     `После нажатия *Start* бот автоматически добавит тебя в список игроков.\n\n` +
-    `Для старта нужно минимум 3 игрока.`
+    `Для старта нужно минимум 3 игрока.\n` +
+    `Старт игры: /startgame`
   );
 }
 
@@ -176,6 +177,15 @@ async function sendRole(player) {
   }
 }
 
+function buildFinalRolesText(lobby) {
+  return lobby.players
+    .map((p, index) => {
+      const status = p.alive ? "жив" : "выбыл";
+      return `${index + 1}. ${p.name} — ${roleNameRu(p.role)} (${status})`;
+    })
+    .join("\n");
+}
+
 function checkWinner(lobby) {
   const infected = getAliveInfected(lobby).length;
   const nonInfected = getAliveNonInfected(lobby).length;
@@ -189,12 +199,19 @@ function checkWinner(lobby) {
 async function finishGame(lobby, winner) {
   lobby.phase = "ended";
 
-  const text =
+  const winText =
     winner === "infected"
-      ? `🦠 *Победа заражённых!*\n\nОни захватили всех.`
-      : `🙂 *Победа мирных!*\n\nВсе заражённые найдены.`;
+      ? `🦠 *Победа заражённых!*`
+      : `🙂 *Победа мирных!*`;
 
-  await bot.sendMessage(lobby.chatId, text, { parse_mode: "Markdown" });
+  const rolesText = buildFinalRolesText(lobby);
+
+  await bot.sendMessage(
+    lobby.chatId,
+    `${winText}\n\n*Игроки и роли:*\n${rolesText}`,
+    { parse_mode: "Markdown" }
+  );
+
   lobbies.delete(String(lobby.chatId));
 }
 
@@ -448,7 +465,7 @@ async function finishVoting(lobby) {
 
     if (player && player.alive) {
       player.alive = false;
-      text += `Изгнан игрок: ${player.name}\nРоль: *${roleNameRu(player.role)}*`;
+      text += `Изгнан игрок: ${player.name}\nРоль игрока: *${roleNameRu(player.role)}*`;
     } else {
       text += `Никто не был изгнан.`;
     }
@@ -694,7 +711,7 @@ bot.on("callback_query", async (query) => {
 
         lobby.nightActions.doctor = String(targetId);
         await bot.answerCallbackQuery(query.id, { text: `Ты лечишь ${target.name}` });
-        await bot.sendMessage(actor.id, `💉 Ты лечишь игрока ${target.name}`);
+        await bot.sendMessage(actor.id, `💊 Ты лечишь игрока ${target.name}`);
       }
 
       if (action === "scan") {
