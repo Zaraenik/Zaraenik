@@ -4,8 +4,7 @@ const TelegramBot = require("node-telegram-bot-api");
 const token = process.env.BOT_TOKEN;
 if (!token) throw new Error("BOT_TOKEN не найден");
 
-const BOT_USERNAME = process.env.BOT_USERNAME;
-if (!BOT_USERNAME) throw new Error("BOT_USERNAME не найден");
+const BOT_USERNAME = "zaraenik_bot";
 
 const bot = new TelegramBot(token, { polling: true });
 
@@ -20,8 +19,7 @@ app.listen(PORT, () => {
   console.log(`Server started on port ${PORT}`);
 });
 
-const lobbies = new Map(); // chatId -> lobby
-const pendingJoinByUser = new Map(); // userId -> chatId
+const lobbies = new Map();
 
 function getDisplayName(user) {
   if (!user) return "Игрок";
@@ -37,6 +35,30 @@ function shuffle(array) {
     [arr[i], arr[j]] = [arr[j], arr[i]];
   }
   return arr;
+}
+
+function getLobby(chatId) {
+  return lobbies.get(String(chatId));
+}
+
+function getPlayer(lobby, userId) {
+  return lobby.players.find((p) => String(p.id) === String(userId));
+}
+
+function getAlivePlayers(lobby) {
+  return lobby.players.filter((p) => p.alive);
+}
+
+function getAliveInfected(lobby) {
+  return lobby.players.filter((p) => p.alive && p.role === "infected");
+}
+
+function getAliveNonInfected(lobby) {
+  return lobby.players.filter((p) => p.alive && p.role !== "infected");
+}
+
+function isCreator(lobby, userId) {
+  return String(lobby.creatorId) === String(userId);
 }
 
 function roleNameRu(role) {
@@ -69,24 +91,8 @@ function roleDescription(role) {
   }
 }
 
-function getLobby(chatId) {
-  return lobbies.get(String(chatId));
-}
-
-function getPlayer(lobby, userId) {
-  return lobby.players.find((p) => String(p.id) === String(userId));
-}
-
-function getAlivePlayers(lobby) {
-  return lobby.players.filter((p) => p.alive);
-}
-
-function getAliveInfected(lobby) {
-  return lobby.players.filter((p) => p.alive && p.role === "infected");
-}
-
-function getAliveNonInfected(lobby) {
-  return lobby.players.filter((p) => p.alive && p.role !== "infected");
+function getJoinLink(lobby) {
+  return `https://t.me/${BOT_USERNAME}?start=join_${lobby.chatId}`;
 }
 
 function buildLobbyText(lobby) {
@@ -94,12 +100,15 @@ function buildLobbyText(lobby) {
     .map((p, index) => `${index + 1}. ${p.name}`)
     .join("\n");
 
+  const joinLink = getJoinLink(lobby);
+
   return (
     `🧪 *Лобби "Заражение"*\n\n` +
     `Создатель: ${lobby.creatorName}\n\n` +
     `*Игроки:*\n${playersText}\n\n` +
-    `Для входа нажми кнопку *Играть* ниже.\n` +
-    `После нажатия откроется бот, нажми *Start* и ты автоматически добавишься в игру.`
+    `Ссылка для входа:\n${joinLink}\n\n` +
+    `Нажми кнопку *Играть* ниже или перейди по ссылке.\n` +
+    `После нажатия *Start* бот автоматически добавит тебя в список игроков.`
   );
 }
 
@@ -109,7 +118,7 @@ function buildLobbyKeyboard(lobby) {
       [
         {
           text: "🎮 Играть",
-          url: `https://t.me/${BOT_USERNAME}?start=join_${lobby.chatId}`
+          url: getJoinLink(lobby)
         }
       ]
     ]
@@ -124,6 +133,7 @@ async function renderLobbyMessage(lobby) {
       chat_id: lobby.chatId,
       message_id: lobby.lobbyMessageId,
       parse_mode: "Markdown",
+      disable_web_page_preview: true,
       reply_markup: buildLobbyKeyboard(lobby)
     });
   } catch (error) {
@@ -155,10 +165,6 @@ async function sendRole(player) {
   } catch (error) {
     console.log(`Не удалось отправить роль игроку ${player.id}:`, error.message);
   }
-}
-
-function isCreator(lobby, userId) {
-  return String(lobby.creatorId) === String(userId);
 }
 
 function checkWinner(lobby) {
@@ -289,7 +295,7 @@ async function finishNight(lobby) {
     for (const [targetId, votes] of Object.entries(counts)) {
       if (votes > maxVotes) {
         maxVotes = votes;
-        finalTarget = Number(targetId);
+        finalTarget = String(targetId);
         hasTie = false;
       } else if (votes === maxVotes) {
         hasTie = true;
@@ -322,10 +328,7 @@ async function finishNight(lobby) {
 
   if (!finalTarget) {
     text += `Ночью ничего не произошло.`;
-  } else if (
-    Number(finalTarget) === Number(doctorTarget) ||
-    Number(finalTarget) === Number(guardTarget)
-  ) {
+  } else if (finalTarget === doctorTarget || finalTarget === guardTarget) {
     const saved = getPlayer(lobby, finalTarget);
     if (saved) {
       text += `Ночью попытка заражения была остановлена.\n${saved.name} удалось спасти.`;
@@ -454,35 +457,24 @@ async function finishVoting(lobby) {
   await startNight(lobby);
 }
 
-async function addUserToLobbyByPending(user) {
-  const userId = String(user.id);
-  const pendingChatId = pendingJoinByUser.get(userId);
-
-  if (!pendingChatId) {
-    return { ok: false, message: "У тебя нет ожидающего входа в игру." };
-  }
-
-  const lobby = getLobby(pendingChatId);
+async function addUserToLobby(user, lobbyChatId) {
+  const lobby = getLobby(lobbyChatId);
 
   if (!lobby) {
-    pendingJoinByUser.delete(userId);
-    return { ok: false, message: "Лобби не найдено или игра уже закончилась." };
+    return { ok: false, text: "Лобби не найдено или игра уже закончилась." };
   }
 
   if (lobby.started) {
-    pendingJoinByUser.delete(userId);
-    return { ok: false, message: "Игра уже началась, зайти нельзя." };
+    return { ok: false, text: "Игра уже началась. Войти нельзя." };
   }
 
   if (lobby.players.length >= 8) {
-    pendingJoinByUser.delete(userId);
-    return { ok: false, message: "Лобби уже заполнено." };
+    return { ok: false, text: "Лобби уже заполнено." };
   }
 
   const already = getPlayer(lobby, user.id);
   if (already) {
-    pendingJoinByUser.delete(userId);
-    return { ok: true, message: "Ты уже есть в этом лобби." };
+    return { ok: true, text: "Ты уже есть в этом лобби." };
   }
 
   const player = {
@@ -493,27 +485,20 @@ async function addUserToLobbyByPending(user) {
   };
 
   lobby.players.push(player);
-  pendingJoinByUser.delete(userId);
 
   await renderLobbyMessage(lobby);
 
   try {
     await bot.sendMessage(
       lobby.chatId,
-      `➕ В игру вошёл игрок: ${player.name}`
+      `➕ В игру вошёл игрок: ${player.name}\nТеперь игроков: ${lobby.players.length}`
     );
   } catch (error) {
-    console.log("Ошибка сообщения в группу о входе:", error.message);
+    console.log("Ошибка сообщения о входе:", error.message);
   }
 
-  return { ok: true, message: `✅ Ты добавлен в лобби.\nТвой ник: ${player.name}` };
+  return { ok: true, text: `✅ Ты добавлен в игру.\nТвой ник: ${player.name}` };
 }
-
-/*
-  =========================
-  КОМАНДЫ
-  =========================
-*/
 
 bot.onText(/^\/start(?:\s+(.+))?$/, async (msg, match) => {
   const chatId = msg.chat.id;
@@ -527,32 +512,14 @@ bot.onText(/^\/start(?:\s+(.+))?$/, async (msg, match) => {
 
   if (payload.startsWith("join_")) {
     const lobbyChatId = payload.replace("join_", "");
-    const lobby = getLobby(lobbyChatId);
-
-    if (!lobby) {
-      await bot.sendMessage(chatId, "Лобби не найдено или игра уже началась.");
-      return;
-    }
-
-    pendingJoinByUser.set(String(user.id), String(lobbyChatId));
-
-    const result = await addUserToLobbyByPending(user);
-    await bot.sendMessage(chatId, result.message);
-    return;
-  }
-
-  const result = await addUserToLobbyByPending(user);
-
-  if (result.ok) {
-    await bot.sendMessage(chatId, result.message);
+    const result = await addUserToLobby(user, lobbyChatId);
+    await bot.sendMessage(chatId, result.text);
     return;
   }
 
   await bot.sendMessage(
     chatId,
-    `Привет, ${getDisplayName(user)}!\n\n` +
-      `Если тебя пригласили в игру, нажми кнопку *Играть* в группе.\n` +
-      `Если кнопка уже была нажата до этого, я попробую добавить тебя автоматически, когда у меня будет ссылка входа.`,
+    `Привет, ${getDisplayName(user)}!\n\nНажми кнопку *Играть* в группе или открой ссылку из лобби.`,
     { parse_mode: "Markdown" }
   );
 });
@@ -597,6 +564,7 @@ bot.onText(/^\/create_game$/, async (msg) => {
 
   const sent = await bot.sendMessage(msg.chat.id, buildLobbyText(lobby), {
     parse_mode: "Markdown",
+    disable_web_page_preview: true,
     reply_markup: buildLobbyKeyboard(lobby)
   });
 
@@ -670,12 +638,6 @@ bot.onText(/^\/cancel_game$/, async (msg) => {
   lobbies.delete(String(msg.chat.id));
   await bot.sendMessage(msg.chat.id, "Игра отменена.");
 });
-
-/*
-  =========================
-  CALLBACK
-  =========================
-*/
 
 bot.on("callback_query", async (query) => {
   try {
