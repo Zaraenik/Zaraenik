@@ -108,7 +108,8 @@ function buildLobbyText(lobby) {
     `*Игроки:*\n${playersText}\n\n` +
     `Ссылка для входа:\n${joinLink}\n\n` +
     `Нажми кнопку *Играть* ниже или перейди по ссылке.\n` +
-    `После нажатия *Start* бот автоматически добавит тебя в список игроков.`
+    `После нажатия *Start* бот автоматически добавит тебя в список игроков.\n\n` +
+    `Для старта нужно минимум 3 игрока.`
   );
 }
 
@@ -142,7 +143,15 @@ async function renderLobbyMessage(lobby) {
 }
 
 function getRolesForCount(count) {
-  if (count < 5) return null;
+  if (count < 3) return null;
+
+  if (count === 3) {
+    return ["infected", "doctor", "civilian"];
+  }
+
+  if (count === 4) {
+    return ["infected", "doctor", "scanner", "civilian"];
+  }
 
   if (count === 5) {
     return ["infected", "doctor", "scanner", "civilian", "civilian"];
@@ -485,17 +494,7 @@ async function addUserToLobby(user, lobbyChatId) {
   };
 
   lobby.players.push(player);
-
   await renderLobbyMessage(lobby);
-
-  try {
-    await bot.sendMessage(
-      lobby.chatId,
-      `➕ В игру вошёл игрок: ${player.name}\nТеперь игроков: ${lobby.players.length}`
-    );
-  } catch (error) {
-    console.log("Ошибка сообщения о входе:", error.message);
-  }
 
   return { ok: true, text: `✅ Ты добавлен в игру.\nТвой ник: ${player.name}` };
 }
@@ -596,7 +595,7 @@ bot.onText(/^\/startgame$/, async (msg) => {
 
   const roles = getRolesForCount(lobby.players.length);
   if (!roles) {
-    await bot.sendMessage(msg.chat.id, "Для старта нужно минимум 5 игроков.");
+    await bot.sendMessage(msg.chat.id, "Для старта нужно минимум 3 игрока.");
     return;
   }
 
