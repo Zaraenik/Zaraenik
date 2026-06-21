@@ -1,3 +1,4 @@
+import requests
 import os, json, time, threading
 from pathlib import Path
 import telebot
@@ -283,6 +284,22 @@ def home(): return "Stars Exchange Bot is working ✅"
 def web():
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
 
+
+# ===== AUTO PING 24/7 ДЛЯ RENDER =====
+PING_URL = "https://zaraenik.onrender.com/"
+PING_INTERVAL = 300  # 5 минут
+
+def auto_ping():
+    while True:
+        try:
+            requests.get(PING_URL, timeout=15)
+            print(f"✅ Auto ping OK: {PING_URL}")
+        except Exception as e:
+            print(f"⚠️ Auto ping error: {e}")
+        time.sleep(PING_INTERVAL)
+# ===== END AUTO PING =====
+
 if __name__ == "__main__":
+    threading.Thread(target=auto_ping, daemon=True).start()
     threading.Thread(target=web, daemon=True).start()
     bot.infinity_polling(skip_pending=True)
