@@ -8,6 +8,7 @@ from flask import Flask
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 SUPPORT = "@Artemwesh"
+PAYMENTS_CHANNEL = "@StarMoneyPay"
 DATA_FILE = Path("data.json")
 LOCK = threading.Lock()
 
@@ -53,7 +54,7 @@ def get_user(data, user_id, username=""):
 def main_menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("⭐ Обменять Stars", "📊 Курс")
-    kb.row("📋 Мои заявки", "⭐ Отзывы")
+    kb.row("📋 Мои заявки", "💸 Выплаты")
     kb.row("❓ FAQ", "🛠 Поддержка")
     return kb
 
@@ -171,6 +172,18 @@ def admin_action(c):
         save_data(data)
     if action == "paid":
         bot.send_message(r["user_id"], f"✅ Заявка #{rid} выплачена.\n\nСпасибо за обмен 💛")
+
+        bot.send_message(
+            PAYMENTS_CHANNEL,
+            f"""✅ Выплата #{rid} успешно выполнена
+
+⭐ Получено: {r['stars']} Stars
+💸 Выплачено: {r['uah']}
+
+🛡 Сделка завершена успешно
+
+StarMoney — обмен Stars на гривны 💛"""
+        )
     else:
         bot.send_message(r["user_id"], f"❌ Заявка #{rid} отклонена. Напишите в поддержку.")
     try: bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=None)
@@ -194,9 +207,9 @@ def faq(m):
 def support(m):
     bot.send_message(m.chat.id, f"🛠 Поддержка: {SUPPORT}")
 
-@bot.message_handler(func=lambda m: m.text == "⭐ Отзывы")
-def reviews(m):
-    bot.send_message(m.chat.id, "⭐ Отзывов пока нет.")
+@bot.message_handler(func=lambda m: m.text == "💸 Выплаты")
+def payments(m):
+    bot.send_message(m.chat.id, "💸 Канал выплат:\n\nhttps://t.me/StarMoneyPay")
 
 @bot.message_handler(func=lambda m: m.text == "📋 Мои заявки")
 def my_req(m):
